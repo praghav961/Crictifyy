@@ -1,5 +1,5 @@
 import { registerSW } from 'virtual:pwa-register';
-registerSW({ immediate: true });
+try { registerSW({ immediate: true }); } catch (e) { console.error('PWA Registration failed', e); }
 import {StrictMode} from 'react';
 import {createRoot} from 'react-dom/client';
 import App from './App.tsx';
