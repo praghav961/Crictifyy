@@ -1,0 +1,162 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    
+    function isOwner(userId) {
+      return request.auth.uid == userId;
+    }
+    
+    function getProfile() {
+      let profile = get(/databases/$(database)/documents/users/$(request.auth.uid));
+      return profile != null ? profile.data : null;
+    }
+
+    function isGlobalAdmin() {
+      let profile = getProfile();
+      return profile != null && profile.roles != null && 'SUPER_ADMIN' in profile.roles;
+    }
+
+    function canHost() {
+      let profile = getProfile();
+      return profile != null && (
+        profile.canHostTournament == true || 
+        (profile.roles != null && ('SUPER_ADMIN' in profile.roles || 'TOURNAMENT_ADMIN' in profile.roles))
+      );
+    }
+    
+    function isTournamentAdmin(tournamentId) {
+      let tournament = get(/databases/$(database)/documents/tournaments/$(tournamentId));
+      return tournament != null && (tournament.data.hostId == request.auth.uid || isGlobalAdmin());
+    }
+    
+    function canManageTeamsAndPlayers() {
+      let profile = getProfile();
+      return profile != null && (
+        isGlobalAdmin() || 
+        (profile.roles != null && ('TOURNAMENT_ADMIN' in profile.roles || 'TEAM_MANAGER' in profile.roles)) || 
+        profile.canHostTournament == true
+      );
+    }
+    
+    function hasActiveScoringSession(matchId) {
+      let sessionId = matchId + "_" + request.auth.uid;
+      let sessionDoc = get(/databases/$(database)/documents/scoringSessions/$(sessionId));
+      return sessionDoc != null &&
+             sessionDoc.data.revoked == false &&
+             sessionDoc.data.expiresAt > request.time.toMillis();
+    }
+    
+    function isMatchAdmin(matchId) {
+      let tId = resource == null ? request.resource.data.tournamentId : resource.data.tournamentId;
+      return isTournamentAdmin(tId);
+    }
+    
+    function isMatchAdminForSubcollections(matchId) {
+      let m = get(/databases/$(database)/documents/matches/$(matchId));
+      return m != null && isTournamentAdmin(m.data.tournamentId);
+    }
+
+    match /users/{userId} {
+      allow read: if isAuthenticated();
+      allow create: if isAuthenticated() && isOwner(userId) && (!request.resource.data.keys().hasAny(['roles', 'canHostTournament']) || (request.resource.data.roles.size() == 1 && request.resource.data.roles[0] == 'VIEWER' && request.resource.data.canHostTournament == false));
+      allow update: if isAuthenticated() && isOwner(userId) && (
+        isGlobalAdmin() || 
+        (!request.resource.data.diff(resource.data).affectedKeys().hasAny(['roles', 'canHostTournament']))
+      );
+      allow delete: if isAuthenticated() && isGlobalAdmin();
+    }
+    
+    match /tournaments/{tournamentId} {
+      allow read: if true;
+      allow create: if isAuthenticated() && canHost() && request.resource.data.hostId == request.auth.uid;
+      allow update, delete: if isAuthenticated() && isTournamentAdmin(tournamentId);
+      
+      match /sponsors/{sponsorId} {
+        allow read: if true;
+        allow write: if isAuthenticated() && isTournamentAdmin(tournamentId);
+      }
+      
+      match /teams/{teamId} {
+        allow read: if true;
+        allow write: if isAuthenticated() && isTournamentAdmin(tournamentId);
+      }
+      
+      match /players/{playerId} {
+        allow read: if true;
+        allow write: if isAuthenticated() && isTournamentAdmin(tournamentId);
+      }
+    }
+    
+    match /matches/{matchId} {
+      allow read: if true;
+      allow create: if isAuthenticated() && isMatchAdmin(matchId);
+      allow update, delete: if isAuthenticated() && (isMatchAdmin(matchId) || hasActiveScoringSession(matchId));
+      
+      match /innings/{inningId} {
+        allow read: if true;
+        allow write: if isAuthenticated() && (isMatchAdminForSubcollections(matchId) || hasActiveScoringSession(matchId));
+      }
+      match /balls/{ballId} {
+        allow read: if true;
+        allow write: if isAuthenticated() && (isMatchAdminForSubcollections(matchId) || hasActiveScoringSession(matchId));
+      }
+    }
+    
+    match /teams/{teamId} {
+      allow read: if true;
+      allow write: if isAuthenticated() && canManageTeamsAndPlayers();
+    }
+    
+    match /players/{playerId} {
+      allow read: if true;
+      allow write: if isAuthenticated() && canManageTeamsAndPlayers();
+    }
+    
+    match /scoringCodes/{codeHash} {
+      allow get: if true;
+      allow list: if isAuthenticated() && isTournamentAdmin(resource.data.tournamentId);
+      allow create, delete: if isAuthenticated() && isTournamentAdmin(request.resource.data.tournamentId);
+      allow update: if isAuthenticated() && (
+        isTournamentAdmin(resource.data.tournamentId) ||
+        (
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['usedCount']) &&
+          request.resource.data.usedCount == resource.data.usedCount + 1 &&
+          resource.data.active == true &&
+          resource.data.revoked == false &&
+          resource.data.usedCount < resource.data.maxUses &&
+          resource.data.expiresAt > request.time.toMillis() &&
+          (resource.data.assignedUserId == null || resource.data.assignedUserId == request.auth.uid)
+        )
+      );
+    }
+    
+    match /scoringSessions/{sessionId} {
+      allow create: if isAuthenticated() &&
+        sessionId == request.resource.data.matchId + "_" + request.auth.uid &&
+        request.resource.data.userId == request.auth.uid &&
+        exists(/databases/$(database)/documents/scoringCodes/$(request.resource.data.codeHash)) &&
+        get(/databases/$(database)/documents/scoringCodes/$(request.resource.data.codeHash)).data.active == true &&
+        get(/databases/$(database)/documents/scoringCodes/$(request.resource.data.codeHash)).data.revoked == false &&
+        get(/databases/$(database)/documents/scoringCodes/$(request.resource.data.codeHash)).data.expiresAt > request.time.toMillis() &&
+        get(/databases/$(database)/documents/scoringCodes/$(request.resource.data.codeHash)).data.matchId == request.resource.data.matchId &&
+        getAfter(/databases/$(database)/documents/scoringCodes/$(request.resource.data.codeHash)).data.usedCount == get(/databases/$(database)/documents/scoringCodes/$(request.resource.data.codeHash)).data.usedCount + 1;
+        
+      allow update: if isAuthenticated() && (
+        isTournamentAdmin(resource.data.tournamentId) ||
+        (resource.data.userId == request.auth.uid && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['lastActivityAt']))
+      );
+      
+      allow read: if isAuthenticated() && (resource.data.userId == request.auth.uid || isTournamentAdmin(resource.data.tournamentId));
+      allow delete: if isAuthenticated() && isTournamentAdmin(resource.data.tournamentId);
+    }
+    
+    match /auditLogs/{logId} {
+      allow create: if isAuthenticated() && request.resource.data.userId == request.auth.uid && request.resource.data.timestamp == request.time;
+      allow read, update, delete: if isAuthenticated() && isGlobalAdmin();
+    }
+  }
+}

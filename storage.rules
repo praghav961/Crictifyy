@@ -1,0 +1,31 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    
+    function isGlobalAdmin() {
+      // Storage rules can't query Firestore natively in all cases without setup, but we can check token claims if set.
+      // Since we don't have custom claims, we restrict uploads generally or let them upload to their own folder.
+      return false; // Can't easily check Firestore roles here without custom claims
+    }
+
+    match /tournaments/{tournamentId}/{allPaths=**} {
+      allow read: if true;
+      // Allow authenticated users to upload images, but limit size and type
+      allow write: if isAuthenticated() && request.resource.size < 5 * 1024 * 1024 && request.resource.contentType.matches('image/.*');
+    }
+    
+    match /users/{userId}/{allPaths=**} {
+      allow read: if true;
+      allow write: if isAuthenticated() && request.auth.uid == userId && request.resource.size < 5 * 1024 * 1024 && request.resource.contentType.matches('image/.*');
+    }
+    
+    match /{allPaths=**} {
+      allow read: if true;
+      allow write: if false; // Default deny
+    }
+  }
+}
